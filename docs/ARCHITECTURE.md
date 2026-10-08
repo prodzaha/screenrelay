@@ -24,6 +24,10 @@ Local configuration is versioned and written by temporary-file replacement. Ther
 
 ## Advanced commands
 
+Manual selection probes the current network state, then holds the chosen profile while polling continues. Two on replies, explicit off, or two network failures establish a stable state. A change from the manual baseline releases the hold. With an unknown baseline, the first stable state establishes it without switching. Display notifications and stale samples must not clear this hold. Explicit --auto clears it; settings, explicit pause and safety errors still suspend switching.
+
+An optional `portable.flag` beside the executable selects `data/` there instead of LocalAppData. This allows the host and Explorer to share real paths when a packaged host redirects AppData writes. Private data must remain outside the public repository. A shell's file-existence check alone does not prove that Explorer or Windows logon startup can access an installation.
+
 - `--trial-tv`, `--trial-monitor`: timed physical trials before background host startup.
 - `--import-prototype <folder> <private-ip>`: one-time import of the original PowerShell profiles. Requires both original visual confirmations and a live, identified Samsung reply. The importer does not switch displays.
 - `--rollback <private-pending-file>`: internal recovery process; not a user-facing configuration option.

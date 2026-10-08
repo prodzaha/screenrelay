@@ -128,10 +128,15 @@ void rollback(const fs::path& file){
 }
 Signal probe(const Config& c){HttpClient client;auto result=client.get(c.address);if(!result.available)return Signal::NoReply;if(result.status!=200)return Signal::Invalid;return parseSignal(result.body,c.model,c.id);}
 void manual(Action action,bool trial=false){
-    paused=true;if(settingsWindow)settingsPreviouslyPaused=true;controller.reset(Action::None);auto c=currentConfig();
+    paused=true;auto c=currentConfig();
     if(!c.ready())throw std::runtime_error("Open settings and capture display profiles first");
-    if(action==Action::Tv&&probe(c)!=Signal::On)throw std::runtime_error("TV is not confirmed on; keeping current display");
-    safeApply(selected(c,action),trial);controller.committed(action);log("Manual selection: "+name(action)+"; automation paused");status();
+    auto initial=probe(c);
+    if(action==Action::Tv&&initial!=Signal::On)throw std::runtime_error("TV is not confirmed on; keeping current display");
+    safeApply(selected(c,action),trial);controller.manual(action,initial);
+    if(initial==Signal::Invalid)throw std::runtime_error("Manual profile applied; unexpected TV identity or response keeps automation paused");
+    {std::lock_guard guard(sampleMutex);pending.clear();}
+    if(!trial){lastError.clear();if(settingsWindow)settingsPreviouslyPaused=false;else paused=false;wakeWorker.notify_all();}
+    log("Manual selection: "+name(action)+(trial?"; timed trial":"; automatic switching waits for TV power change"));status();
 }
 void resume(){auto c=currentConfig();if(!c.ready())throw std::runtime_error("Configuration is incomplete");build(c.monitor);build(c.tv);controller.reset(activeAction(c));{std::lock_guard guard(sampleMutex);pending.clear();}paused=false;lastError.clear();wakeWorker.notify_all();log("Automation enabled");status();}
 void autostart(bool enabled){
@@ -240,7 +245,7 @@ void showSettings(){
     control(L"STATIC",L"Ctrl+Alt hotkeys: Both / Monitor / TV",0,20,268,485,20,0);
     for(auto pair:{std::pair{110,draft.bothKey},std::pair{111,draft.monitorKey},std::pair{112,draft.tvKey}}){int x=20+(pair.first-110)*165;control(L"COMBOBOX",L"",CBS_DROPDOWNLIST|WS_VSCROLL|WS_TABSTOP,x,292,155,200,pair.first);for(int f=1;f<=24;++f){auto label=L"F"+std::to_wstring(f);SendDlgItemMessageW(settingsWindow,pair.first,CB_ADDSTRING,0,(LPARAM)label.c_str());}SendDlgItemMessageW(settingsWindow,pair.first,CB_SETCURSEL,pair.second-VK_F1,0);}
     control(L"BUTTON",L"Test monitor picture",BS_PUSHBUTTON|WS_TABSTOP,20,330,230,28,TRIAL_MONITOR);control(L"BUTTON",L"Test TV picture",BS_PUSHBUTTON|WS_TABSTOP,270,330,235,28,TRIAL_TV);
-    control(L"STATIC",lastError.empty()?L"No tray icon. Manual hotkeys pause automation.":wide(lastError).c_str(),0,20,368,485,35,INFO);control(L"BUTTON",L"Save and start automation",BS_DEFPUSHBUTTON|WS_TABSTOP,240,408,265,28,SAVE);
+    control(L"STATIC",lastError.empty()?L"No tray icon. Manual choice lasts until TV power changes.":wide(lastError).c_str(),0,20,368,485,35,INFO);control(L"BUTTON",L"Save and start automation",BS_DEFPUSHBUTTON|WS_TABSTOP,240,408,265,28,SAVE);
     refreshChoices();ShowWindow(settingsWindow,SW_SHOW);SetForegroundWindow(settingsWindow);status();
 }
 void handleCommand(unsigned command){if(command==1)resume();else if(command==2)manual(Action::Monitor);else if(command==3)manual(Action::Tv);else if(command==4)manual(Action::Both);else if(command==5){paused=true;if(settingsWindow)settingsPreviouslyPaused=true;log("Automation paused");status();}else if(command==6)PostQuitMessage(0);else if(command==7)showSettings();else if(command==8)status();}
@@ -250,7 +255,7 @@ LRESULT CALLBACK mainProc(HWND h,UINT msg,WPARAM w,LPARAM l){
             if(w){throw std::runtime_error("Network worker stopped unexpectedly");}
             std::optional<Sample> next;{std::lock_guard guard(sampleMutex);next=pending.take();}if(!next)return 0;auto sample=*next;
             auto c=currentConfig();if(sample.generation!=c.generation)return 0;
-            if(GetTickCount64()-sample.time>1500&&sample.signal!=Signal::Invalid){controller.reset(activeAction(c));return 0;}
+            if(GetTickCount64()-sample.time>1500&&sample.signal!=Signal::Invalid){controller.committed(activeAction(c));controller.clearEvidence();return 0;}
             std::string signal=sample.signal==Signal::On?"on":sample.signal==Signal::Off?"off":sample.signal==Signal::Invalid?"invalid":"no-reply";
             if(signal!=lastSignal){lastSignal=signal;log("TV signal: "+signal);status();}
             if(!paused){auto action=controller.feed(sample.signal);if(action==Action::Pause)throw std::runtime_error("Unexpected TV identity or response; automation paused");if(action!=Action::None){safeApply(selected(c,action));controller.committed(action);log("Automatic selection: "+name(action));status();}}
@@ -258,8 +263,8 @@ LRESULT CALLBACK mainProc(HWND h,UINT msg,WPARAM w,LPARAM l){
         }
         if(msg==WM_HOTKEY){handleCommand(w==1?2:w==2?3:4);return 0;}
         if(msg==WM_COMMAND_REMOTE){handleCommand((unsigned)w);return 0;}
-        if(msg==WM_POWERBROADCAST){if(w==PBT_APMRESUMEAUTOMATIC||w==PBT_APMRESUMESUSPEND){auto c=currentConfig();if(c.ready())controller.reset(activeAction(c));log("Resumed; display identifiers will be rebound before next switch");}return TRUE;}
-        if(msg==WM_DISPLAYCHANGE){auto c=currentConfig();if(c.ready())controller.reset(activeAction(c));status();return 0;}
+        if(msg==WM_POWERBROADCAST){if(w==PBT_APMRESUMEAUTOMATIC||w==PBT_APMRESUMESUSPEND){auto c=currentConfig();if(c.ready()){controller.committed(activeAction(c));controller.clearEvidence();}log("Resumed; display identifiers will be rebound before next switch");}return TRUE;}
+        if(msg==WM_DISPLAYCHANGE){auto c=currentConfig();if(c.ready())controller.committed(activeAction(c));status();return 0;}
     }catch(const std::exception& e){messageError(e,msg==WM_COMMAND_REMOTE||msg==WM_HOTKEY);return 0;}
     return DefWindowProcW(h,msg,w,l);
 }
@@ -267,7 +272,10 @@ unsigned commandNumber(const std::wstring& arg){if(arg==L"--auto")return 1;if(ar
 int wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int){
     std::thread poller;HANDLE singleton=nullptr;
     try{
-        wchar_t local[MAX_PATH]{};wincheck(SHGetFolderPathW(nullptr,CSIDL_LOCAL_APPDATA,nullptr,SHGFP_TYPE_CURRENT,local),"Locate local application data");root=fs::path(local)/L"ScreenRelay";fs::create_directories(root);
+        auto appDirectory=fs::path(executable()).parent_path();
+        if(fs::exists(appDirectory/L"portable.flag"))root=appDirectory/L"data";
+        else {wchar_t local[MAX_PATH]{};wincheck(SHGetFolderPathW(nullptr,CSIDL_LOCAL_APPDATA,nullptr,SHGFP_TYPE_CURRENT,local),"Locate local application data");root=fs::path(local)/L"ScreenRelay";}
+        fs::create_directories(root);
         auto sid=userSid();mutexName=L"Local\\ScreenRelay-"+sid;className=L"ScreenRelay-"+sid;
         CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);int argc=0;LPWSTR* argv=CommandLineToArgvW(GetCommandLineW(),&argc);std::vector<std::wstring> args;for(int i=1;i<argc;++i)args.emplace_back(argv[i]);LocalFree(argv);
         if(args.size()==2&&args[0]==L"--rollback"){rollback(fs::path(args[1]));CoUninitialize();return 0;}

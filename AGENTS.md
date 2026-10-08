@@ -13,7 +13,7 @@ Do not add a tray icon, cloud service, screenshot capture, telemetry, updater, m
 - Poll the verified Samsung endpoint every 500 ms; do not overlap requests. Whole-response deadline: 200 ms. Disable redirects and proxies. Limit response bodies to 64 KiB.
 - Two consecutive verified `on` replies select TV. Explicit `off` or two consecutive network failures select monitor. A successful response clears failures. Wrong identity, malformed JSON, unexpected power state or HTTP error pauses automation.
 - There is no added switching delay. Do not repeat `SetDisplayConfig` on every poll.
-- Manual selection pauses automation; `--auto` explicitly resumes it.
+- Manual selection keeps polling active and holds the selected profile until the next confirmed TV power change. Unknown initial state must first establish a baseline without switching. Topology changes must not clear this hold. `--auto` explicitly cancels it. Explicit pause, settings and safety errors still suspend automation.
 
 ## Display invariants
 

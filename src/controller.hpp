@@ -16,19 +16,35 @@ public:
 class Controller {
     int on_ = 0, misses_ = 0;
     Action current_ = Action::None;
+    bool manualHold_=false;
+    std::optional<bool> baseline_;
+    Action stable(bool on) {
+        if(manualHold_) {
+            if(!baseline_){baseline_=on;return Action::None;}
+            if(*baseline_==on)return Action::None;
+            manualHold_=false;baseline_.reset();
+        }
+        auto target=on?Action::Tv:Action::Monitor;
+        return current_!=target?target:Action::None;
+    }
 public:
-    void reset(Action current) { current_=current; on_=misses_=0; }
+    void clearEvidence(){on_=misses_=0;}
+    void reset(Action current) { current_=current;clearEvidence();manualHold_=false;baseline_.reset(); }
+    void manual(Action current,Signal initial) {
+        current_=current;clearEvidence();manualHold_=true;baseline_.reset();
+        if(initial==Signal::On)baseline_=true;else if(initial==Signal::Off)baseline_=false;
+    }
     void committed(Action action) { current_=action; }
     Action feed(Signal signal) {
         if (signal==Signal::Invalid) { on_=misses_=0; return Action::Pause; }
         if (signal==Signal::On) {
             misses_=0; if(on_<2)++on_;
-            return on_==2 && current_!=Action::Tv ? Action::Tv : Action::None;
+            return on_==2 ? stable(true) : Action::None;
         }
         on_=0;
-        if(signal==Signal::Off) { misses_=0; return current_!=Action::Monitor ? Action::Monitor : Action::None; }
+        if(signal==Signal::Off) { misses_=0; return stable(false); }
         if(misses_<2)++misses_;
-        return misses_==2 && current_!=Action::Monitor ? Action::Monitor : Action::None;
+        return misses_==2 ? stable(false) : Action::None;
     }
 };
 }

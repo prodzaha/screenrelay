@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Manual display selections keep polling enabled and last until the next confirmed TV power-state change. Unknown initial state establishes a baseline first; topology updates preserve the override.
+- Optional `portable.flag` stores private settings in `data/` beside the EXE, avoiding packaged-host AppData redirection during local installation.
+
 ## 0.1.0
 
 - Native hidden Windows x64 controller with a small settings window.

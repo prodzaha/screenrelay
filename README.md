@@ -33,7 +33,7 @@ The address must be a private LAN IPv4 address. A compatible Samsung local API m
 | Ctrl+Alt+F11 | Desk monitor only |
 | Ctrl+Alt+F9 | TV only, after confirming the TV is on |
 
-A manual selection pauses automation. Run `ScreenRelay.exe --auto` to resume. Hotkeys can be changed in settings; existing registrations are not stolen. Windows reserves F12 for debugging, so choose another function key if registration fails on your PC.
+A manual selection keeps polling enabled and holds the chosen display profile until the next confirmed TV power-state change. If the initial network state is unknown, the first stable state establishes a baseline without undoing the manual choice. Run `ScreenRelay.exe --auto` to cancel this hold and follow the current TV state immediately. Hotkeys can be changed in settings; existing registrations are not stolen. Windows reserves F12 for debugging, so choose another function key if registration fails on your PC.
 
 Settings are intentionally small: TV address, the two displays, three captured profiles, startup and function keys. Change resolutions/frequencies in Windows and recapture profiles. Arbitrary macros, an advanced rule editor and more than two configured displays are **not implemented**.
 
