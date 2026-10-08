@@ -4,6 +4,7 @@ Validation date: 2026-10-09. This is an unsigned, native Windows x64 build.
 
 - CMake 3.31.6 / LLVM-MinGW Clang 21.1.8: clean Release build passed.
 - CTest: all three suites passed (controller/ordered queue, strict network parser, connector identity and exact profile consistency).
+- Controlled local HTTP fixture: five deliberately delayed responses cancelled in 203–219 ms including call overhead, then 100 valid responses at 500 ms cadence passed. This checks actual callback cancellation, not only JSON parsing.
 - Physical Windows 11 / RTX 3070 setup: Redmi 3840×2160 at 160 Hz and Samsung QE65QN85BAUXCE 3840×2160 at 120 Hz. All three exact profiles validated without changing modes.
 - Native TV-only trial was visually confirmed; independent 30-second recovery restored both screens.
 - Native monitor-only trial applied and verified. Automatic selection of the powered-on TV applied and verified.
