@@ -18,7 +18,7 @@ Profiles store captured source/target modes and semantic hardware identity. Mode
 
 Before a display write, the preceding desktop is saved privately and the same EXE starts in recovery mode. It acknowledges readiness before the main process applies a profile. The guard restores the prior profile after 10 seconds unless verification removes its pending record. Visual setup trials use 30 seconds. Recovery is temporary; there is no permanently resident second controller.
 
-Autostart uses the current user's interactive Task Scheduler context, least privilege, no runtime limit, and at most three restarts after a failure. The application is a Windows GUI executable with a hidden command window; it never opens a console or tray icon for background startup.
+Autostart stores a quoted executable path and --auto in HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run under ScreenRelay. It runs in the current user's session without elevation. --startup-off removes only this application's value. The application is a Windows GUI executable with a hidden command window; it never opens a console or tray icon for background startup.
 
 Local configuration is versioned and written by temporary-file replacement. There is one instance per user/session and a shared display-switch mutex. A second invocation delivers commands to the hidden host. Local status and two rotating log files contain errors rather than displaying unattended popup dialogs.
 

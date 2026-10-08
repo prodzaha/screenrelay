@@ -51,7 +51,7 @@ Response and switching time are separate. Expect roughly **1–2 seconds** once 
 - If a profile cannot be applied or verified, automation pauses and records the reason. Open settings to inspect it.
 - Drivers, EDID overrides, TDR, HDR/VRR and router settings are not modified.
 
-Local settings, status and bounded logs live under `%LOCALAPPDATA%\ScreenRelay`. These contain private device details and must not be committed or attached publicly. `--diagnose` writes a report without addresses, UUIDs or GPU paths. Startup uses a hidden, non-elevated task for the current user and can be disabled in settings or with `--startup-off`.
+Local settings, status and bounded logs live under `%LOCALAPPDATA%\ScreenRelay`. These contain private device details and must not be committed or attached publicly. `--diagnose` writes a report without addresses, UUIDs or GPU paths. Startup uses the current user's Windows Run entry and can be disabled in settings or with `--startup-off`.
 
 ## Commands
 

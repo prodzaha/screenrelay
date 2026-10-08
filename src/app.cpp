@@ -134,25 +134,14 @@ void manual(Action action,bool trial=false){
     safeApply(selected(c,action),trial);controller.committed(action);log("Manual selection: "+name(action)+"; automation paused");status();
 }
 void resume(){auto c=currentConfig();if(!c.ready())throw std::runtime_error("Configuration is incomplete");build(c.monitor);build(c.tv);controller.reset(activeAction(c));{std::lock_guard guard(sampleMutex);pending.clear();}paused=false;lastError.clear();wakeWorker.notify_all();log("Automation enabled");status();}
-template<class T> struct Com {
-    T* p=nullptr;~Com(){if(p)p->Release();}T** out(){return &p;}T* operator->(){return p;}
-};
-struct Bstr {BSTR p;explicit Bstr(const std::wstring& s):p(SysAllocString(s.c_str())){}~Bstr(){SysFreeString(p);}operator BSTR()const{return p;}};
-void hrcheck(HRESULT result){if(FAILED(result))throw std::runtime_error("Windows autostart configuration failed: "+std::to_string((unsigned long)result));}
 void autostart(bool enabled){
-    Com<ITaskService> service;hrcheck(CoCreateInstance(CLSID_TaskScheduler,nullptr,CLSCTX_INPROC_SERVER,IID_ITaskService,(void**)service.out()));
-    VARIANT empty{};VariantInit(&empty);hrcheck(service->Connect(empty,empty,empty,empty));
-    Com<ITaskFolder> folder;hrcheck(service->GetFolder(Bstr(L"\\"),folder.out()));
-    auto taskName=L"ScreenRelay-"+userSid();
-    if(!enabled){HRESULT result=folder->DeleteTask(Bstr(taskName),0);if(FAILED(result)&&result!=HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND))hrcheck(result);return;}
-    Com<ITaskDefinition> task;hrcheck(service->NewTask(0,task.out()));
-    Com<IRegistrationInfo> info;hrcheck(task->get_RegistrationInfo(info.out()));hrcheck(info->put_Description(Bstr(L"ScreenRelay: automatic local Samsung TV / monitor switching")));
-    Com<IPrincipal> principal;hrcheck(task->get_Principal(principal.out()));auto sid=userSid();hrcheck(principal->put_UserId(Bstr(sid)));hrcheck(principal->put_LogonType(TASK_LOGON_INTERACTIVE_TOKEN));hrcheck(principal->put_RunLevel(TASK_RUNLEVEL_LUA));
-    Com<ITaskSettings> settings;hrcheck(task->get_Settings(settings.out()));hrcheck(settings->put_Hidden(VARIANT_TRUE));hrcheck(settings->put_DisallowStartIfOnBatteries(VARIANT_FALSE));hrcheck(settings->put_StopIfGoingOnBatteries(VARIANT_FALSE));hrcheck(settings->put_ExecutionTimeLimit(Bstr(L"PT0S")));hrcheck(settings->put_RestartCount(3));hrcheck(settings->put_RestartInterval(Bstr(L"PT1M")));hrcheck(settings->put_MultipleInstances(TASK_INSTANCES_IGNORE_NEW));
-    Com<ITriggerCollection> triggers;hrcheck(task->get_Triggers(triggers.out()));Com<ITrigger> trigger;hrcheck(triggers->Create(TASK_TRIGGER_LOGON,trigger.out()));Com<ILogonTrigger> logon;hrcheck(trigger->QueryInterface(IID_ILogonTrigger,(void**)logon.out()));hrcheck(logon->put_UserId(Bstr(sid)));
-    Com<IActionCollection> actions;hrcheck(task->get_Actions(actions.out()));Com<IAction> action;hrcheck(actions->Create(TASK_ACTION_EXEC,action.out()));Com<IExecAction> exec;hrcheck(action->QueryInterface(IID_IExecAction,(void**)exec.out()));hrcheck(exec->put_Path(Bstr(executable())));hrcheck(exec->put_Arguments(Bstr(L"--auto")));hrcheck(exec->put_WorkingDirectory(Bstr(root.wstring())));
-    VARIANT user{};VariantInit(&user);user.vt=VT_BSTR;user.bstrVal=SysAllocString(sid.c_str());Com<IRegisteredTask> registered;
-    HRESULT result=folder->RegisterTaskDefinition(Bstr(taskName),task.p,TASK_CREATE_OR_UPDATE,user,empty,TASK_LOGON_INTERACTIVE_TOKEN,empty,registered.out());VariantClear(&user);hrcheck(result);
+    HKEY key=nullptr;
+    LONG result=RegCreateKeyExW(HKEY_CURRENT_USER,L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",0,nullptr,0,KEY_SET_VALUE,nullptr,&key,nullptr);
+    if(result!=ERROR_SUCCESS)throw std::runtime_error("Cannot access per-user Windows autostart");
+    if(enabled){auto command=L"\""+executable()+L"\" --auto";result=RegSetValueExW(key,L"ScreenRelay",0,REG_SZ,reinterpret_cast<const BYTE*>(command.c_str()),static_cast<DWORD>((command.size()+1)*sizeof(wchar_t)));}
+    else result=RegDeleteValueW(key,L"ScreenRelay");
+    RegCloseKey(key);
+    if(result!=ERROR_SUCCESS&&!(result==ERROR_FILE_NOT_FOUND&&!enabled))throw std::runtime_error("Cannot update per-user Windows autostart");
 }
 void worker(){
     try {
