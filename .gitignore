@@ -1,0 +1,9 @@
+/build/
+/build-cmake/
+/dist/
+*.log
+config.json
+profiles.json
+status.json
+*.user
+*.pdb
