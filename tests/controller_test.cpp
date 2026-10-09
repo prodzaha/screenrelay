@@ -3,6 +3,12 @@
 #include <stdexcept>
 void check(bool ok, const char* why) { if (!ok) throw std::runtime_error(why); }
 int main() {
+    relay::AvailabilityGate gate;
+    check(gate.canAttempt(relay::Action::Tv),"new target is eligible");
+    gate.defer(relay::Action::Tv);
+    check(!gate.canAttempt(relay::Action::Tv),"missing HDMI must not be retried every poll");
+    check(gate.canAttempt(relay::Action::Monitor),"missing HDMI must not block monitor fallback");
+    gate.refresh();check(gate.canAttempt(relay::Action::Tv),"device or power transition enables a fresh validation");
     relay::SampleQueue queue;
     check(queue.push({relay::Signal::On,1,1,0}),"queue first sample");
     check(queue.push({relay::Signal::Invalid,1,2,0}),"queue safety signal");
@@ -14,6 +20,12 @@ int main() {
     check(!queue.push({relay::Signal::On,1,17,0}),"overflow must be reported, not silently drop evidence");
     queue.clear();check(!queue.take(),"clear resets queue");
     relay::Controller c;
+    check(c.feed(relay::Signal::On)==relay::Action::None,"initial on debounces");
+    check(c.feed(relay::Signal::Transient)==relay::Action::None,"temporary response neither pauses nor switches");
+    check(c.feed(relay::Signal::On)==relay::Action::None,"temporary response breaks consecutive on evidence");
+    check(c.feed(relay::Signal::On)==relay::Action::Tv,"valid evidence resumes without user action");
+    check(c.power()==true,"confirmed power is observable independently from chosen display");
+    c.reset(relay::Action::None);
     c.manual(relay::Action::Monitor,relay::Signal::On);
     for(int i=0;i<6;++i)check(c.feed(relay::Signal::On)==relay::Action::None,"manual monitor persists while TV stays on");
     c.committed(relay::Action::Monitor);

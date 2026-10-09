@@ -11,9 +11,9 @@ Do not add a tray icon, cloud service, screenshot capture, telemetry, updater, m
 - Windows 11 x64, native C++20/Win32/WinHTTP. No PowerShell or .NET process in normal operation.
 - Two configured displays; three profiles: monitor, TV, both.
 - Poll the verified Samsung endpoint every 500 ms; do not overlap requests. Whole-response deadline: 200 ms. Disable redirects and proxies. Limit response bodies to 64 KiB.
-- Two consecutive verified `on` replies select TV. Explicit `off` or two consecutive network failures select monitor. A successful response clears failures. Wrong identity, malformed JSON, unexpected power state or HTTP error pauses automation.
+- Two consecutive verified `on` replies select TV. Explicit `off` or two consecutive network failures select monitor. A successful response clears failures. Wrong identity and unexpected nontransient HTTP errors pause automation. Incomplete/malformed replies, unknown power states and HTTP 408/429/5xx clear consecutive evidence and keep polling without switching. Verified standby means off.
 - There is no added switching delay. Do not repeat `SetDisplayConfig` on every poll.
-- Manual selection keeps polling active and holds the selected profile until the next confirmed TV power change. Unknown initial state must first establish a baseline without switching. Topology changes must not clear this hold. `--auto` explicitly cancels it. Explicit pause, settings and safety errors still suspend automation.
+- Manual selection keeps polling active and holds the selected profile until the next confirmed TV power change. Unknown initial state must first establish a baseline without switching. Topology changes must not clear this hold. `--auto` explicitly cancels it. Explicit pause and safety errors suspend automation. Opening settings keeps polling active; timed trials and transactional save temporarily suspend it. Trials block nested switching commands and preserve newer safety pauses.
 
 ## Display invariants
 
@@ -22,7 +22,7 @@ Do not add a tray icon, cloud service, screenshot capture, telemetry, updater, m
 3. Preserve exact captured modes, including rational refresh rates: 120 is not automatically interchangeable with 120000/1001.
 4. Validate before applying; omit SDC_ALLOW_CHANGES and do not write temporary topology to the Windows display database.
 5. Verify identity, active count, resolution, refresh, rotation and desktop positions after applying. Single-display origin is 0,0.
-6. Keep independent recovery armed until verification succeeds. Never remove it to hide a failing test.
+6. Keep independent recovery armed until verification succeeds. Recovery must never apply an empty topology; prefer a verified monitor over a TV-only prior topology. Keep the guardian armed when the display lock times out. Never remove it to hide a failing test.
 7. Missing hardware, uncertain identity, invalid settings or failed verification must not trigger a retry loop that keeps flashing screens.
 8. First-time profile setup requires real picture confirmation for both single-display modes; a successful API call is not physical confirmation.
 
@@ -33,13 +33,13 @@ Do not change drivers, TDR registry values, EDID overrides, HDR/VRR or router se
 - `src/controller.hpp`: pure decision logic; no network, UI or display writes.
 - `src/network.hpp`: bounded LAN HTTP adapter and strict identity parsing.
 - `src/display.hpp`: capture, serialization, live rebinding, validation and application.
-- `src/app.cpp`: small settings UI, hidden host, hotkeys, startup and recovery process.
+- `src/app.cpp`: small settings UI, hidden host, hotkeys and recovery process.
 
 The JSON dependency is pinned in `vendor/`; keep its license. Avoid extra runtimes and frameworks for the minimal settings screen.
 
 ## Changing behavior safely
 
-Read both READMEs and architecture notes first. Reproduce the relevant failure and add a behavior test before changing logic. Keep changes limited to the requested scenario. Existing user settings belong to LocalAppData, not the repository.
+Read both READMEs and architecture notes first. Reproduce the relevant failure and add a behavior test before changing logic. Keep changes limited to the requested scenario. Existing user settings belong to LocalAppData or portable data/, never the repository. Observation epochs invalidate in-flight samples across manual/resume/trial transitions. Keep working shortcuts and automation if one hotkey fails.
 
 Run the complete CMake/CTest suite, then `--diagnose` for non-mutating Windows validation. Exercise actual switching only with a confirmed visible target and recovery active. Obtain human confirmation for a new display setup.
 
@@ -56,3 +56,5 @@ Release only after a fresh independent review and passing tests. Package the EXE
 ## Future ideas
 
 Additional TV adapters, more displays, user-defined profiles and macros are possible extensions. They are not part of v0.1.0. Add one narrowly specified capability at a time; keep the existing small setup and recovery path usable.
+
+Startup registration lives in `src/startup.hpp`: a least-privilege per-user Task Scheduler task must prove it can launch the actual EXE before enabling logon startup. Roll back registration on failed configuration commits.

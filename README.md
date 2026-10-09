@@ -12,7 +12,7 @@ A small Windows app that switches between your desk monitor and a Samsung TV. Tu
 - Local Samsung API only. No cloud, account, TV remote pairing, telemetry or automatic updates.
 - One request every **500 ms**, one in flight at a time, **200 ms total response deadline**.
 - Two verified `on` responses select the TV. Explicit `off` or two consecutive missed responses select the monitor.
-- A failed identity check or malformed response pauses automation instead of guessing.
+- A wrong TV identity pauses automation. Incomplete replies, unknown power states and HTTP 408/429/5xx keep polling without switching. Verified `standby` is treated as off.
 - Windows validates the exact saved modes before switching; a separate recovery process protects each change.
 
 ## Set up in a minute
@@ -33,9 +33,9 @@ The address must be a private LAN IPv4 address. A compatible Samsung local API m
 | Ctrl+Alt+F11 | Desk monitor only |
 | Ctrl+Alt+F9 | TV only, after confirming the TV is on |
 
-A manual selection keeps polling enabled and holds the chosen display profile until the next confirmed TV power-state change. If the initial network state is unknown, the first stable state establishes a baseline without undoing the manual choice. Run `ScreenRelay.exe --auto` to cancel this hold and follow the current TV state immediately. Hotkeys can be changed in settings; existing registrations are not stolen. Windows reserves F12 for debugging, so choose another function key if registration fails on your PC.
+A manual selection keeps polling enabled and holds the chosen display profile until the next confirmed TV power-state change. If the initial network state is unknown, the first stable state establishes a baseline without undoing the manual choice. Run `ScreenRelay.exe --auto` to cancel this hold and follow the current TV state immediately. Opening settings keeps polling active. Timed picture trials temporarily block automation and other switching commands. Hotkeys can be changed in settings; existing registrations are not stolen. A blocked shortcut leaves the other keys and automation enabled. Windows reserves F12 for debugging, so choose another function key if registration fails on your PC.
 
-Settings are intentionally small: TV address, the two displays, three captured profiles, startup and function keys. Change resolutions/frequencies in Windows and recapture profiles. Arbitrary macros, an advanced rule editor and more than two configured displays are **not implemented**.
+Settings are intentionally small: TV address, the two displays, three captured profiles, startup and function keys. Select Both with the configured shortcut before changing resolutions/frequencies in Windows and recapturing profiles. Arbitrary macros, an advanced rule editor and more than two configured displays are **not implemented**.
 
 ## What “off” means
 
@@ -46,12 +46,12 @@ Response and switching time are separate. Expect roughly **1–2 seconds** once 
 ## Safety and local files
 
 - Exact modes are validated and checked after application. Silent refresh-rate substitution is not allowed.
-- GPU IDs are rebound from the live Windows topology after startup and sleep. Ambiguous or missing devices stop the change.
-- A separate temporary process restores the preceding desktop if a switch is not acknowledged within 10 seconds.
+- GPU IDs are rebound from the live Windows topology after startup and sleep. Missing devices await a topology or power-state change; ambiguous identity pauses switching.
+- A separate temporary process restores a safe profile after 10 seconds without acknowledgement. The verified monitor takes priority over a TV-only previous topology. Windows has up to 1500 ms to settle before verification fails.
 - If a profile cannot be applied or verified, automation pauses and records the reason. Open settings to inspect it.
 - Drivers, EDID overrides, TDR, HDR/VRR and router settings are not modified.
 
-Local settings, status and bounded logs live under `%LOCALAPPDATA%\ScreenRelay`. These contain private device details and must not be committed or attached publicly. `--diagnose` writes a report without addresses, UUIDs or GPU paths. Startup uses the current user's Windows Run entry and can be disabled in settings or with `--startup-off`.
+Local settings, status and bounded logs live under `%LOCALAPPDATA%\ScreenRelay`. With `portable.flag` beside the EXE, files live in its `data/` subfolder instead. The release ZIP includes this flag: keep it in a permanent writable folder. Private data must never be published. `--diagnose` writes a report without addresses, UUIDs or GPU paths. Startup uses a hidden per-user Task Scheduler logon task without elevation. Enabling it requires a successful launch probe through Task Scheduler. Disable it in settings or with `--startup-off`.
 
 ## Commands
 
@@ -86,3 +86,5 @@ Run `ScreenRelay.exe --startup-off`, then `--both`, then `--exit`. Delete the ap
 Possible future work: more displays, custom profiles/rules, macros and additional TV adapters. These are ideas, not current features. See [AGENTS.md](AGENTS.md) before extending behavior.
 
 MIT licensed. Windows and Samsung are trademarks of their respective owners; this project is independent.
+
+A hung graphics driver cannot be repaired by this utility. Recovery keeps waiting for the display lock; Windows driver calls themselves are not cancellable.

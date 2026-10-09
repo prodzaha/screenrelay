@@ -21,16 +21,25 @@ inline bool localAddress(const std::string& address) {
     unsigned n=ntohl(parsed.S_un.S_addr);
     return (n>>24)==10 || (n>>20)==0xac1 || (n>>16)==0xc0a8 || (n>>16)==0xa9fe;
 }
-inline Signal parseSignal(const std::string& body,const std::string& model,const std::string& id) {
+struct NetworkObservation {Signal signal;std::string reason;};
+inline NetworkObservation parseObservation(const std::string& body,const std::string& model,const std::string& id) {
     try {
         auto j=json::parse(body);auto& d=j.at("device");
-        if(d.at("modelName").get<std::string>()!=model || d.at("id").get<std::string>()!=id || d.at("type").get<std::string>()!="Samsung SmartTV")return Signal::Invalid;
+        if(d.at("modelName").get<std::string>()!=model || d.at("id").get<std::string>()!=id || d.at("type").get<std::string>()!="Samsung SmartTV")return {Signal::Invalid,"identity-mismatch"};
         auto power=d.at("PowerState").get<std::string>();
-        if(power=="on")return Signal::On;if(power=="off")return Signal::Off;
-    }catch(...){}
-    return Signal::Invalid;
+        if(power=="on")return {Signal::On,"power-on"};
+        if(power=="off"||power=="standby")return {Signal::Off,power=="off"?"power-off":"power-standby"};
+        return {Signal::Transient,"unknown-power-state"};
+    }catch(...){return {Signal::Transient,"incomplete-device-response"};}
 }
+inline Signal parseSignal(const std::string& body,const std::string& model,const std::string& id){return parseObservation(body,model,id).signal;}
 struct HttpResult { bool available=false; DWORD status=0; std::string body; };
+inline NetworkObservation classify(const HttpResult& response,const std::string& model,const std::string& id) {
+    if(!response.available)return {Signal::NoReply,"network-unavailable"};
+    if(response.status==200)return parseObservation(response.body,model,id);
+    if(response.status>=500||response.status==408||response.status==429)return {Signal::Transient,"temporary-http-"+std::to_string(response.status)};
+    return {Signal::Invalid,"unexpected-http-"+std::to_string(response.status)};
+}
 class HttpClient {
     struct Request {
         HANDLE done=CreateEventW(nullptr,TRUE,FALSE,nullptr);

@@ -31,6 +31,11 @@ inline void wincheck(LONG code,const char* operation) {
     if(code!=ERROR_SUCCESS)throw std::runtime_error(std::string(operation)+": Windows error "+std::to_string(code));
 }
 struct Snapshot { std::vector<DISPLAYCONFIG_PATH_INFO> paths; std::vector<DISPLAYCONFIG_MODE_INFO> modes; };
+struct DisplayUnavailable:std::runtime_error{using std::runtime_error::runtime_error;};
+template<class Check,class Clock,class Wait> inline bool confirmUntil(Check check,Clock now,Wait wait,uint64_t timeout) {
+    auto start=now();
+    for(;;){try{if(check())return true;}catch(const std::exception&){}if(now()-start>=timeout)return false;wait();}
+}
 inline Snapshot query(UINT32 flags=QDC_ONLY_ACTIVE_PATHS) {
     for(int retry=0;retry<4;++retry) {
         UINT32 p=0,m=0;wincheck(GetDisplayConfigBufferSizes(flags,&p,&m),"Display buffer sizes");
@@ -112,7 +117,7 @@ inline Snapshot build(const Profile& profile) {
         for(size_t i=0;i<profile.size();++i)if(id.same(profile[i].device))options[i].push_back(p);
     }
     for(auto& list:options) {
-        if(list.empty())throw std::runtime_error("Configured display is unavailable; keeping current screen");
+        if(list.empty())throw DisplayUnavailable("Configured display is unavailable; keeping current screen");
         std::stable_sort(list.begin(),list.end(),[](auto& a,auto& b){return (a.flags&DISPLAYCONFIG_PATH_ACTIVE)>(b.flags&DISPLAYCONFIG_PATH_ACTIVE);});
         std::set<UINT32> targets;for(auto& p:list)targets.insert(p.targetInfo.id);
         if(targets.size()!=1)throw std::runtime_error("Display identity is ambiguous; select devices again");
@@ -150,6 +155,12 @@ inline bool matches(const Profile& desired,const Profile& actual) {
     }
     return true;
 }
+inline std::vector<Profile> recoveryCandidates(const Profile& previous,const Profile& monitor) {
+    if(previous.empty()){if(monitor.size()==1)return {monitor};throw std::runtime_error("No nonempty recovery profile");}
+    if(monitor.size()!=1||matches(monitor,previous))return {previous};
+    bool hadMonitor=std::any_of(previous.begin(),previous.end(),[&](const auto& e){return e.device.same(monitor[0].device);});
+    return hadMonitor?std::vector<Profile>{previous,monitor}:std::vector<Profile>{monitor,previous};
+}
 inline bool consistentProfiles(const Profile& monitor,const Profile& tv,const Profile& both) {
     if(monitor.size()!=1||tv.size()!=1||both.size()!=2||monitor[0].device.same(tv[0].device)||both[0].device.same(both[1].device))return false;
     for(const auto* single:{&monitor,&tv}) {
@@ -161,10 +172,11 @@ inline bool consistentProfiles(const Profile& monitor,const Profile& tv,const Pr
     return true;
 }
 inline void apply(const Profile& profile) {
-    if(matches(profile,capture(query())))return;
+    if(profile.empty())throw std::runtime_error("Refusing empty display topology");
+    try{if(matches(profile,capture(query())))return;}catch(const std::exception&){}
     auto s=build(profile);
     wincheck(SetDisplayConfig((UINT32)s.paths.size(),s.paths.data(),(UINT32)s.modes.size(),s.modes.data(),SDC_APPLY|SDC_USE_SUPPLIED_DISPLAY_CONFIG),"Apply exact display profile");
-    if(!matches(profile,capture(query())))throw std::runtime_error("Display verification failed after application");
+    if(!confirmUntil([&]{return matches(profile,capture(query()));},[]{return GetTickCount64();},[]{Sleep(50);},1500))throw std::runtime_error("Display verification did not settle to exact saved modes within 1500 ms");
 }
 inline std::vector<unsigned char> base64(const std::string& text) {
     DWORD n=0;if(!CryptStringToBinaryA(text.c_str(),(DWORD)text.size(),CRYPT_STRING_BASE64,nullptr,&n,nullptr,nullptr))throw std::runtime_error("Invalid prototype profile");

@@ -1,4 +1,5 @@
 #include "network.hpp"
+#include "startup.hpp"
 #include <shellapi.h>
 #include <shlobj.h>
 #include <sddl.h>
@@ -48,8 +49,13 @@ struct Config {
 SampleQueue pending;
 std::atomic<bool> paused=true;
 bool settingsPreviouslyPaused=true;
-std::string lastError,lastSignal="unknown";
+bool setupTrialActive=false,running=true;
+unsigned safetyEpoch=0;
+json keyStatus=json::object();
+std::string keyWarning;
+std::string lastError,lastSignal="unknown",lastReason;
 Controller controller;
+AvailabilityGate availability;
 std::vector<Identity> choices;
 Config draft;
 std::wstring executable(){std::wstring p(32768,0);DWORD n=GetModuleFileNameW(nullptr,p.data(),(DWORD)p.size());if(!n||n==p.size())throw std::runtime_error("Cannot locate executable");p.resize(n);return p;}
@@ -62,9 +68,9 @@ std::wstring userSid(){
 }
 json readJson(const fs::path& p){std::ifstream f(p,std::ios::binary);if(!f)throw std::runtime_error("Cannot read "+utf8(p.filename().wstring()));return json::parse(f);}
 void writeJson(const fs::path& p,const json& j){
-    auto temp=p;temp+=L".tmp";
+    auto temp=p;temp+=L"."+std::to_wstring(GetCurrentProcessId())+L"."+std::to_wstring(GetCurrentThreadId())+L".tmp";
     {std::ofstream f(temp,std::ios::binary|std::ios::trunc);if(!f)throw std::runtime_error("Cannot save local data");f<<j.dump(2);f.flush();if(!f)throw std::runtime_error("Cannot write local data");}
-    if(!MoveFileExW(temp.c_str(),p.c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH))throw std::runtime_error("Cannot atomically replace local data");
+    if(!MoveFileExW(temp.c_str(),p.c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)){auto error=GetLastError();std::error_code ec;fs::remove(temp,ec);throw std::runtime_error("Cannot atomically replace local data: Windows error "+std::to_string(error));}
 }
 void log(const std::string& message){
     try {
@@ -76,11 +82,12 @@ void log(const std::string& message){
 }
 Config currentConfig(){std::lock_guard guard(configMutex);return config;}
 void replaceConfig(Config c){std::lock_guard guard(configMutex);c.generation=config.generation+1;config=std::move(c);}
+void newObservationEpoch(){std::lock_guard guard(configMutex);++config.generation;std::lock_guard samples(sampleMutex);pending.clear();}
 const Profile& selected(const Config& c,Action action){if(action==Action::Monitor)return c.monitor;if(action==Action::Tv)return c.tv;return c.both;}
-Action activeAction(const Config& c){auto actual=capture(query());if(matches(c.monitor,actual))return Action::Monitor;if(matches(c.tv,actual))return Action::Tv;if(matches(c.both,actual))return Action::Both;return Action::None;}
+Action activeAction(const Config& c){try{auto actual=capture(query());if(matches(c.monitor,actual))return Action::Monitor;if(matches(c.tv,actual))return Action::Tv;if(matches(c.both,actual))return Action::Both;}catch(const std::exception&){}return Action::None;}
 std::string name(Action a){if(a==Action::Monitor)return "monitor";if(a==Action::Tv)return "tv";if(a==Action::Both)return "both";return "other";}
 void status(){
-    try{auto c=currentConfig();writeJson(root/L"status.json",{{"version","0.1.0"},{"automatic",!paused},{"active",c.ready()?name(activeAction(c)):"unconfigured"},{"network",lastSignal},{"lastError",lastError}});}catch(...){}
+    try{auto c=currentConfig();writeJson(root/L"status.json",{{"version","0.1.1"},{"running",running},{"automatic",running&&!paused},{"startup",c.startup},{"hotkeys",keyStatus},{"hotkeyWarning",keyWarning},{"active",c.ready()?name(activeAction(c)):"unconfigured"},{"network",lastSignal},{"lastError",lastError},{"networkReason",lastReason}});}catch(...){}
 }
 void launch(const std::wstring& args){
     auto exe=executable();std::wstring line=L"\""+exe+L"\" "+args;STARTUPINFOW s{};s.cb=sizeof(s);s.dwFlags=STARTF_USESHOWWINDOW;s.wShowWindow=SW_HIDE;PROCESS_INFORMATION p{};
@@ -96,12 +103,14 @@ public:
 };
 void safeApply(const Profile& profile,bool trial=false){
     SwitchLock lock;
-    auto previous=capture(query());if(matches(profile,previous)&&!trial)return;
+    auto c=currentConfig();auto monitor=c.ready()?c.monitor:Profile{};
+    Profile previous;try{previous=capture(query());}catch(const std::exception&){if(monitor.empty())throw;log("Current topology unreadable; verified monitor recovery required");}
+    if(matches(profile,previous)&&!trial)return;
     build(profile); // Validate before starting recovery or changing any screen.
     cancelGuards();
     auto file=root/(L"guard-"+std::to_wstring(GetCurrentProcessId())+L"-"+std::to_wstring(GetTickCount64())+L".json");
     auto ready=file;ready+=L".ready";
-    writeJson(file,{{"previous",saveProfile(previous)},{"seconds",trial?30:10}});
+    writeJson(file,{{"previous",saveProfile(previous)},{"monitor",monitor.empty()?json::array():saveProfile(monitor)},{"seconds",trial?30:10}});
     launch(L"--rollback \""+file.wstring()+L"\"");
     ULONGLONG start=GetTickCount64();while(!fs::exists(ready)&&GetTickCount64()-start<3000)Sleep(20);
     if(!fs::exists(ready)){std::error_code ec;fs::remove(file,ec);throw std::runtime_error("Recovery process did not become ready; switch refused");}
@@ -110,43 +119,47 @@ void safeApply(const Profile& profile,bool trial=false){
         if(!trial){fs::remove(file);std::error_code ec;fs::remove(ready,ec);}
         log(trial?"Trial applied; independent recovery in 30 seconds":"Profile applied and verified");
     }catch(...){
-        try{apply(previous);fs::remove(file);std::error_code ec;fs::remove(ready,ec);log("Previous display profile restored");}catch(...){log("Immediate restoration failed; independent recovery remains armed");}
+        bool restored=false;
+        for(const auto& candidate:recoveryCandidates(previous,monitor)){try{apply(candidate);restored=true;break;}catch(const std::exception& e){log(std::string("Recovery candidate failed: ")+e.what());}}
+        if(restored){fs::remove(file);std::error_code ec;fs::remove(ready,ec);log("Safe display profile restored");}else log("Immediate restoration failed; independent recovery remains armed");
         throw;
     }
 }
 void rollback(const fs::path& file){
     if(file.parent_path()!=root||!file.filename().wstring().starts_with(L"guard-"))throw std::runtime_error("Recovery file outside local data directory");
-    auto j=readJson(file);auto profile=loadProfile(j.at("previous"));int seconds=j.at("seconds");if(seconds!=10&&seconds!=30)throw std::runtime_error("Invalid recovery deadline");
-    build(profile);auto ready=file;ready+=L".ready";writeJson(ready,{{"ready",true}});
-    Sleep(seconds*1000);
-    SwitchLock lock;
-    if(fs::exists(file)){
-        try{apply(profile);log("Independent recovery restored previous profile");}catch(const std::exception& e){log(std::string("Independent recovery could not restore: ")+e.what());}
-        std::error_code ec;fs::remove(file,ec);
+    auto j=readJson(file);Profile profile;if(!j.at("previous").empty())profile=loadProfile(j.at("previous"));int seconds=j.at("seconds");if(seconds!=10&&seconds!=30)throw std::runtime_error("Invalid recovery deadline");
+    Profile monitor;if(j.contains("monitor")&&!j.at("monitor").empty())monitor=loadProfile(j.at("monitor"));
+    auto candidates=recoveryCandidates(profile,monitor);bool valid=false;
+    for(const auto& candidate:candidates){try{build(candidate);valid=true;break;}catch(const std::exception&) {}}
+    if(!valid)throw std::runtime_error("No safe recovery display is available");
+    auto ready=file;ready+=L".ready";writeJson(ready,{{"ready",true}});
+    auto deadline=GetTickCount64()+seconds*1000;while(fs::exists(file)&&GetTickCount64()<deadline)Sleep(100);
+    while(fs::exists(file)){
+        try{SwitchLock lock;if(fs::exists(file)){for(const auto& candidate:candidates){try{apply(candidate);log("Independent recovery restored a safe display profile");break;}catch(const std::exception& e){log(std::string("Independent recovery candidate failed: ")+e.what());}}std::error_code ec;fs::remove(file,ec);}break;}
+        catch(const std::exception& e){log(std::string("Recovery waiting for display lock: ")+e.what());Sleep(1000);}
     }
     std::error_code ec;fs::remove(ready,ec);
 }
-Signal probe(const Config& c){HttpClient client;auto result=client.get(c.address);if(!result.available)return Signal::NoReply;if(result.status!=200)return Signal::Invalid;return parseSignal(result.body,c.model,c.id);}
+Signal probe(const Config& c){HttpClient client;auto observation=classify(client.get(c.address),c.model,c.id);lastReason=observation.reason;return observation.signal;}
 void manual(Action action,bool trial=false){
-    paused=true;auto c=currentConfig();
+    bool wasPaused=paused.exchange(true);newObservationEpoch();auto c=currentConfig();
     if(!c.ready())throw std::runtime_error("Open settings and capture display profiles first");
     auto initial=probe(c);
-    if(action==Action::Tv&&initial!=Signal::On)throw std::runtime_error("TV is not confirmed on; keeping current display");
-    safeApply(selected(c,action),trial);controller.manual(action,initial);
+    if(action==Action::Tv&&initial!=Signal::On){if(initial==Signal::Invalid)throw std::runtime_error("TV identity is unsafe; keeping current display");paused=wasPaused;wakeWorker.notify_all();throw DisplayUnavailable("TV is not confirmed on; keeping current display and automation");}
+    try{safeApply(selected(c,action),trial);}catch(const DisplayUnavailable&){paused=wasPaused;wakeWorker.notify_all();throw;}
+    controller.manual(action,initial);availability.refresh();
     if(initial==Signal::Invalid)throw std::runtime_error("Manual profile applied; unexpected TV identity or response keeps automation paused");
     {std::lock_guard guard(sampleMutex);pending.clear();}
-    if(!trial){lastError.clear();if(settingsWindow)settingsPreviouslyPaused=false;else paused=false;wakeWorker.notify_all();}
+    if(!trial){lastError.clear();paused=false;wakeWorker.notify_all();}
     log("Manual selection: "+name(action)+(trial?"; timed trial":"; automatic switching waits for TV power change"));status();
 }
-void resume(){auto c=currentConfig();if(!c.ready())throw std::runtime_error("Configuration is incomplete");build(c.monitor);build(c.tv);controller.reset(activeAction(c));{std::lock_guard guard(sampleMutex);pending.clear();}paused=false;lastError.clear();wakeWorker.notify_all();log("Automation enabled");status();}
+void resume(){newObservationEpoch();auto c=currentConfig();if(!c.ready())throw std::runtime_error("Configuration is incomplete");controller.reset(activeAction(c));availability.refresh();paused=false;lastError.clear();wakeWorker.notify_all();log("Automation enabled");status();}
 void autostart(bool enabled){
-    HKEY key=nullptr;
-    LONG result=RegCreateKeyExW(HKEY_CURRENT_USER,L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",0,nullptr,0,KEY_SET_VALUE,nullptr,&key,nullptr);
-    if(result!=ERROR_SUCCESS)throw std::runtime_error("Cannot access per-user Windows autostart");
-    if(enabled){auto command=L"\""+executable()+L"\" --auto";result=RegSetValueExW(key,L"ScreenRelay",0,REG_SZ,reinterpret_cast<const BYTE*>(command.c_str()),static_cast<DWORD>((command.size()+1)*sizeof(wchar_t)));}
-    else result=RegDeleteValueW(key,L"ScreenRelay");
-    RegCloseKey(key);
-    if(result!=ERROR_SUCCESS&&!(result==ERROR_FILE_NOT_FOUND&&!enabled))throw std::runtime_error("Cannot update per-user Windows autostart");
+    auto nonce=std::to_wstring(GetCurrentProcessId())+L"-"+std::to_wstring(GetTickCount64());
+    auto receipt=root/(L"startup-probe-"+nonce+L".json");
+    try{setAutostart(enabled,executable(),root.wstring(),userSid(),nonce,[&]{try{return fs::exists(receipt)&&readJson(receipt).value("ready",false);}catch(...){return false;}});}
+    catch(...){std::error_code ec;fs::remove(receipt,ec);throw;}
+    std::error_code ec;fs::remove(receipt,ec);
 }
 void worker(){
     try {
@@ -154,15 +167,15 @@ void worker(){
         while(!quitWorker){
             auto start=std::chrono::steady_clock::now();auto c=currentConfig();
             if(c.ready()&&!paused){
-                auto result=client.get(c.address);Signal signal=!result.available?Signal::NoReply:(result.status==200?parseSignal(result.body,c.model,c.id):Signal::Invalid);
-                bool queued;{std::lock_guard guard(sampleMutex);queued=pending.push({signal,c.generation,++sequence,GetTickCount64()});}
-                PostMessageW(mainWindow,WM_SAMPLE,queued?0:2,0);
+                auto observation=classify(client.get(c.address),c.model,c.id);
+                bool queued;{std::lock_guard guard(sampleMutex);queued=pending.push({observation.signal,c.generation,++sequence,GetTickCount64(),observation.reason});}
+                PostMessageW(mainWindow,WM_SAMPLE,queued?0:2,c.generation);
             }
             std::unique_lock lock(configMutex);wakeWorker.wait_until(lock,start+std::chrono::milliseconds(500),[]{return quitWorker.load();});
         }
     }catch(...){PostMessageW(mainWindow,WM_SAMPLE,1,0);}
 }
-void messageError(const std::exception& e,bool visible){lastError=e.what();paused=true;if(settingsWindow)settingsPreviouslyPaused=true;log("Paused: "+lastError);status();if(visible)MessageBoxW(settingsWindow,wide(lastError).c_str(),L"ScreenRelay",MB_OK|MB_ICONWARNING);}
+void messageError(const std::exception& e,bool visible){++safetyEpoch;lastError=e.what();paused=true;if(settingsWindow)settingsPreviouslyPaused=true;log("Paused: "+lastError);status();if(visible)MessageBoxW(settingsWindow,wide(lastError).c_str(),L"ScreenRelay",MB_OK|MB_ICONWARNING);}
 HWND control(const wchar_t* cls,const wchar_t* text,DWORD style,int x,int y,int w,int h,int id){
     HWND c=CreateWindowExW(0,cls,text,WS_CHILD|WS_VISIBLE|style,x,y,w,h,settingsWindow,(HMENU)(INT_PTR)id,GetModuleHandleW(nullptr),nullptr);
     SendMessageW(c,WM_SETFONT,(WPARAM)GetStockObject(DEFAULT_GUI_FONT),TRUE);return c;
@@ -171,17 +184,21 @@ std::wstring field(int id){HWND c=GetDlgItem(settingsWindow,id);int n=GetWindowT
 void refreshChoices(){
     choices.clear();auto all=query(QDC_ALL_PATHS);std::set<std::string> seen;
     for(auto& p:all.paths){if(!p.targetInfo.targetAvailable)continue;try{auto id=identity(p);auto key=id.adapter+"/"+std::to_string(id.technology)+"/"+std::to_string(id.connector);if(seen.insert(key).second)choices.push_back(id);}catch(...){}}
+    size_t liveCount=choices.size();
+    for(const auto* profile:{&draft.monitor,&draft.tv})if(profile->size()==1&&!std::any_of(choices.begin(),choices.end(),[&](const auto& d){return d.same((*profile)[0].device);}))choices.push_back((*profile)[0].device);
     for(int combo:{MONITOR,TV})SendDlgItemMessageW(settingsWindow,combo,CB_RESETCONTENT,0,0);
-    for(auto& d:choices){auto label=wide(d.name+" ("+(d.technology==5?"HDMI":d.technology==10?"DisplayPort":"display")+")");for(int combo:{MONITOR,TV})SendDlgItemMessageW(settingsWindow,combo,CB_ADDSTRING,0,(LPARAM)label.c_str());}
+    for(size_t index=0;index<choices.size();++index){auto& d=choices[index];auto label=wide(d.name+" ("+(d.technology==5?"HDMI":d.technology==10?"DisplayPort":"display")+(index>=liveCount?", unavailable)":")"));for(int combo:{MONITOR,TV})SendDlgItemMessageW(settingsWindow,combo,CB_ADDSTRING,0,(LPARAM)label.c_str());}
     for(size_t i=0;i<choices.size();++i){if((draft.monitor.size()==1&&choices[i].same(draft.monitor[0].device))||(draft.monitor.empty()&&choices[i].technology==10))SendDlgItemMessageW(settingsWindow,MONITOR,CB_SETCURSEL,i,0);if((draft.tv.size()==1&&choices[i].same(draft.tv[0].device))||(draft.tv.empty()&&choices[i].technology==5))SendDlgItemMessageW(settingsWindow,TV,CB_SETCURSEL,i,0);}
 }
-void registerKeys(){
+void registerKeys(bool strict=true){
     for(int id=1;id<=3;++id)UnregisterHotKey(mainWindow,id);auto c=currentConfig();
+    keyStatus=json::object();keyWarning.clear();
     if(!c.ready())return;
-    bool ok=true;ok=RegisterHotKey(mainWindow,1,MOD_CONTROL|MOD_ALT|MOD_NOREPEAT,c.monitorKey)&&ok;ok=RegisterHotKey(mainWindow,2,MOD_CONTROL|MOD_ALT|MOD_NOREPEAT,c.tvKey)&&ok;ok=RegisterHotKey(mainWindow,3,MOD_CONTROL|MOD_ALT|MOD_NOREPEAT,c.bothKey)&&ok;
-    if(!ok){for(int id=1;id<=3;++id)UnregisterHotKey(mainWindow,id);throw std::runtime_error("A hotkey is unavailable. Change hotkeys in settings; no existing shortcut was taken over.");}
+    int id=0;for(auto pair:{std::pair{"monitor",c.monitorKey},std::pair{"tv",c.tvKey},std::pair{"both",c.bothKey}}){bool ok=RegisterHotKey(mainWindow,++id,MOD_CONTROL|MOD_ALT|MOD_NOREPEAT,pair.second);keyStatus[pair.first]=ok;if(!ok)keyWarning+="Ctrl+Alt+F"+std::to_string(pair.second-VK_F1+1)+" unavailable; ";}
+    if(!keyWarning.empty()){log(keyWarning);if(strict)throw std::runtime_error(keyWarning+"change hotkeys in settings");}
 }
 LRESULT CALLBACK settingsProc(HWND h,UINT msg,WPARAM w,LPARAM l){
+    bool displayTrial=false;
     try {
         if(msg==WM_COMMAND){
             switch(LOWORD(w)){
@@ -209,10 +226,12 @@ LRESULT CALLBACK settingsProc(HWND h,UINT msg,WPARAM w,LPARAM l){
                 bool tv=LOWORD(w)==TRIAL_TV;const auto& profile=tv?draft.tv:draft.monitor;
                 if(profile.size()!=1||draft.both.size()!=2)throw std::runtime_error("Capture profiles first");
                 if(tv&&probe(draft)!=Signal::On)throw std::runtime_error("Test the TV address and turn the TV on before its display trial");
+                displayTrial=true;setupTrialActive=true;struct TrialScope{~TrialScope(){setupTrialActive=false;}} trialScope;bool previouslyPaused=paused.exchange(true);auto trialSafety=safetyEpoch;newObservationEpoch();
                 safeApply(profile,true);
                 int answer=MessageBoxW(h,L"Do you see this message on the selected single display?\n\nConfirm within 30 seconds. Otherwise both displays return automatically.",L"ScreenRelay display test",MB_YESNO|MB_ICONQUESTION);
                 bool confirmed=answer==IDYES&&matches(profile,capture(query()));
                 safeApply(draft.both);
+                newObservationEpoch();if(safetyEpoch==trialSafety)paused=previouslyPaused;wakeWorker.notify_all();
                 if(tv)draft.tvVerified=confirmed;else draft.monitorVerified=confirmed;
                 SetDlgItemTextW(h,INFO,confirmed?L"Single-display picture confirmed. Test the other display, then save.":L"Trial not confirmed. Both displays restored.");return 0;
             }
@@ -220,21 +239,22 @@ LRESULT CALLBACK settingsProc(HWND h,UINT msg,WPARAM w,LPARAM l){
                 if(!draft.ready()||draft.address!=utf8(field(IP)))throw std::runtime_error("Test the TV address and capture profiles before saving");
                 draft.startup=SendDlgItemMessageW(h,STARTUP,BM_GETCHECK,0,0)==BST_CHECKED;
                 for(auto pair:{std::pair{110,&draft.bothKey},std::pair{111,&draft.monitorKey},std::pair{112,&draft.tvKey}}){int index=(int)SendDlgItemMessageW(h,pair.first,CB_GETCURSEL,0,0);if(index<0)throw std::runtime_error("Select all three hotkeys");*pair.second=VK_F1+index;}
-                auto checked=Config::load(draft.save());build(checked.monitor);build(checked.tv);build(checked.both);
+                auto checked=Config::load(draft.save());for(const auto* profile:{&checked.monitor,&checked.tv,&checked.both})try{build(*profile);}catch(const DisplayUnavailable&){}
+                bool beforeSave=paused.exchange(true);struct SaveScope{bool old;~SaveScope(){paused=old;wakeWorker.notify_all();}} saveScope{beforeSave};
                 auto old=currentConfig();replaceConfig(checked);
                 try{registerKeys();autostart(checked.startup);writeJson(root/L"config.json",checked.save());}catch(...){replaceConfig(old);try{registerKeys();autostart(old.startup);}catch(...){}throw;}
-                settingsPreviouslyPaused=false;DestroyWindow(h);resume();return 0;
+                settingsPreviouslyPaused=false;DestroyWindow(h);resume();saveScope.old=false;return 0;
             }
             }
         }
-        if(msg==WM_CLOSE){paused=settingsPreviouslyPaused;DestroyWindow(h);status();return 0;}
+        if(msg==WM_CLOSE){DestroyWindow(h);status();return 0;}
         if(msg==WM_DESTROY){settingsWindow=nullptr;return 0;}
-    }catch(const std::exception& e){messageError(e,true);return 0;}
+    }catch(const std::exception& e){if(displayTrial)messageError(e,true);else{log(std::string("Settings validation: ")+e.what());SetDlgItemTextW(h,INFO,wide(e.what()).c_str());MessageBoxW(h,wide(e.what()).c_str(),L"ScreenRelay",MB_OK|MB_ICONWARNING);}return 0;}
     return DefWindowProcW(h,msg,w,l);
 }
 void showSettings(){
     if(settingsWindow){ShowWindow(settingsWindow,SW_SHOW);SetForegroundWindow(settingsWindow);return;}
-    settingsPreviouslyPaused=paused.load();paused=true;draft=currentConfig();
+    draft=currentConfig();
     WNDCLASSW cls{};cls.lpfnWndProc=settingsProc;cls.hInstance=GetModuleHandleW(nullptr);cls.lpszClassName=L"ScreenRelaySettings";cls.hCursor=LoadCursorW(nullptr,IDC_ARROW);cls.hbrBackground=(HBRUSH)(COLOR_BTNFACE+1);RegisterClassW(&cls);
     settingsWindow=CreateWindowExW(WS_EX_DLGMODALFRAME,cls.lpszClassName,L"ScreenRelay — settings",WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU, CW_USEDEFAULT,CW_USEDEFAULT,560,480,nullptr,nullptr,cls.hInstance,nullptr);
     control(L"STATIC",L"Samsung TV IPv4 address",0,20,18,240,20,0);control(L"EDIT",wide(draft.address).c_str(),WS_BORDER|ES_AUTOHSCROLL|WS_TABSTOP,20,42,285,24,IP);control(L"BUTTON",L"Test TV",BS_PUSHBUTTON|WS_TABSTOP,325,40,180,28,TEST);
@@ -248,24 +268,26 @@ void showSettings(){
     control(L"STATIC",lastError.empty()?L"No tray icon. Manual choice lasts until TV power changes.":wide(lastError).c_str(),0,20,368,485,35,INFO);control(L"BUTTON",L"Save and start automation",BS_DEFPUSHBUTTON|WS_TABSTOP,240,408,265,28,SAVE);
     refreshChoices();ShowWindow(settingsWindow,SW_SHOW);SetForegroundWindow(settingsWindow);status();
 }
-void handleCommand(unsigned command){if(command==1)resume();else if(command==2)manual(Action::Monitor);else if(command==3)manual(Action::Tv);else if(command==4)manual(Action::Both);else if(command==5){paused=true;if(settingsWindow)settingsPreviouslyPaused=true;log("Automation paused");status();}else if(command==6)PostQuitMessage(0);else if(command==7)showSettings();else if(command==8)status();}
+void handleCommand(unsigned command){if(setupTrialActive&&command!=8){log("Command deferred during timed setup confirmation; repeat after closing confirmation");return;}if(command==1)resume();else if(command==2)manual(Action::Monitor);else if(command==3)manual(Action::Tv);else if(command==4)manual(Action::Both);else if(command==5){paused=true;if(settingsWindow)settingsPreviouslyPaused=true;log("Automation paused");status();}else if(command==6)PostQuitMessage(0);else if(command==7)showSettings();else if(command==8)status();}
 LRESULT CALLBACK mainProc(HWND h,UINT msg,WPARAM w,LPARAM l){
     try{
         if(msg==WM_SAMPLE){
+            if(w==2&&(unsigned)l!=currentConfig().generation)return 0;
             if(w){throw std::runtime_error("Network worker stopped unexpectedly");}
             std::optional<Sample> next;{std::lock_guard guard(sampleMutex);next=pending.take();}if(!next)return 0;auto sample=*next;
             auto c=currentConfig();if(sample.generation!=c.generation)return 0;
             if(GetTickCount64()-sample.time>1500&&sample.signal!=Signal::Invalid){controller.committed(activeAction(c));controller.clearEvidence();return 0;}
-            std::string signal=sample.signal==Signal::On?"on":sample.signal==Signal::Off?"off":sample.signal==Signal::Invalid?"invalid":"no-reply";
-            if(signal!=lastSignal){lastSignal=signal;log("TV signal: "+signal);status();}
-            if(!paused){auto action=controller.feed(sample.signal);if(action==Action::Pause)throw std::runtime_error("Unexpected TV identity or response; automation paused");if(action!=Action::None){safeApply(selected(c,action));controller.committed(action);log("Automatic selection: "+name(action));status();}}
+            std::string signal=sample.signal==Signal::On?"on":sample.signal==Signal::Off?"off":sample.signal==Signal::Invalid?"invalid":sample.signal==Signal::Transient?"transient":"no-reply";
+            if(signal!=lastSignal||sample.reason!=lastReason){lastSignal=signal;lastReason=sample.reason;log("TV signal: "+signal+" ("+lastReason+")");status();}
+            if(!paused){auto before=controller.power();auto action=controller.feed(sample.signal);if(before!=controller.power())availability.refresh();if(action==Action::Pause)throw std::runtime_error("Unsafe TV response: "+sample.reason);if(action!=Action::None&&availability.canAttempt(action)){try{safeApply(selected(c,action));controller.committed(action);lastError.clear();log("Automatic selection: "+name(action));}catch(const DisplayUnavailable& e){availability.defer(action);lastError=e.what();log("Waiting for display availability: "+name(action));}status();}}
             return 0;
         }
-        if(msg==WM_HOTKEY){handleCommand(w==1?2:w==2?3:4);return 0;}
-        if(msg==WM_COMMAND_REMOTE){handleCommand((unsigned)w);return 0;}
-        if(msg==WM_POWERBROADCAST){if(w==PBT_APMRESUMEAUTOMATIC||w==PBT_APMRESUMESUSPEND){auto c=currentConfig();if(c.ready()){controller.committed(activeAction(c));controller.clearEvidence();}log("Resumed; display identifiers will be rebound before next switch");}return TRUE;}
-        if(msg==WM_DISPLAYCHANGE){auto c=currentConfig();if(c.ready())controller.committed(activeAction(c));status();return 0;}
-    }catch(const std::exception& e){messageError(e,msg==WM_COMMAND_REMOTE||msg==WM_HOTKEY);return 0;}
+        if(msg==WM_HOTKEY){MSG queued{};while(PeekMessageW(&queued,h,WM_HOTKEY,WM_HOTKEY,PM_REMOVE))w=queued.wParam;handleCommand(w==1?2:w==2?3:4);return 0;}
+        if(msg==WM_COMMAND_REMOTE){if(w==9){auto updated=Config::load(readJson(root/L"config.json"));{std::lock_guard guard(configMutex);config.startup=updated.startup;}draft.startup=updated.startup;if(settingsWindow)SendDlgItemMessageW(settingsWindow,STARTUP,BM_SETCHECK,updated.startup?BST_CHECKED:BST_UNCHECKED,0);status();return 0;}handleCommand((unsigned)w);return 0;}
+        if(msg==WM_POWERBROADCAST){if(w==PBT_APMRESUMEAUTOMATIC||w==PBT_APMRESUMESUSPEND){availability.refresh();auto c=currentConfig();if(c.ready()){controller.committed(activeAction(c));controller.clearEvidence();}log("Resumed; display identifiers will be rebound before next switch");}return TRUE;}
+        if(msg==WM_DISPLAYCHANGE||msg==WM_DEVICECHANGE){availability.refresh();auto c=currentConfig();if(c.ready())controller.committed(activeAction(c));status();return 0;}
+    }catch(const DisplayUnavailable& e){lastError=e.what();log("Requested display is temporarily unavailable");status();return 0;}
+    catch(const std::exception& e){messageError(e,msg==WM_COMMAND_REMOTE||msg==WM_HOTKEY);return 0;}
     return DefWindowProcW(h,msg,w,l);
 }
 unsigned commandNumber(const std::wstring& arg){if(arg==L"--auto")return 1;if(arg==L"--monitor")return 2;if(arg==L"--tv")return 3;if(arg==L"--both")return 4;if(arg==L"--pause")return 5;if(arg==L"--exit")return 6;if(arg==L"--settings")return 7;if(arg==L"--status")return 8;return 0;}
@@ -279,6 +301,10 @@ int wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int){
         auto sid=userSid();mutexName=L"Local\\ScreenRelay-"+sid;className=L"ScreenRelay-"+sid;
         CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);int argc=0;LPWSTR* argv=CommandLineToArgvW(GetCommandLineW(),&argc);std::vector<std::wstring> args;for(int i=1;i<argc;++i)args.emplace_back(argv[i]);LocalFree(argv);
         if(args.size()==2&&args[0]==L"--rollback"){rollback(fs::path(args[1]));CoUninitialize();return 0;}
+        if(args.size()==2&&args[0]==L"--startup-probe"){
+            if(args[1].empty()||args[1].size()>64||args[1].find_first_not_of(L"0123456789-")!=std::wstring::npos)throw std::runtime_error("Invalid startup probe token");
+            writeJson(root/(L"startup-probe-"+args[1]+L".json"),{{"ready",true}});CoUninitialize();return 0;
+        }
         try{if(fs::exists(root/L"config.json"))config=Config::load(readJson(root/L"config.json"));}catch(const std::exception& e){lastError=e.what();log("Settings require repair");}
         if(args.size()==3&&args[0]==L"--import-prototype"){
             Config c;c.tvKey=VK_F12;fs::path folder=args[1];c.address=utf8(args[2]);c.monitor=importPrototype(readJson(folder/L"Redmi.json"));c.tv=importPrototype(readJson(folder/L"TV.json"));c.both=importPrototype(readJson(folder/L"Extended.json"));
@@ -286,11 +312,11 @@ int wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int){
             HttpClient client;auto response=client.get(c.address);if(!response.available||response.status!=200)throw std::runtime_error("Turn TV on before importing profiles");auto d=json::parse(response.body).at("device");if(d.at("type")!="Samsung SmartTV")throw std::runtime_error("Not a Samsung television");c.model=d.at("modelName");c.id=d.at("id");c=Config::load(c.save());build(c.monitor);build(c.tv);build(c.both);writeJson(root/L"config.json",c.save());log("Prototype profiles imported; no displays changed");return 0;
         }
         if(!args.empty()&&args[0]==L"--diagnose"){
-            json report={{"version","0.1.0"},{"displays",json::array()}};for(auto& e:capture(query()))report["displays"].push_back({{"name",e.device.name},{"width",e.source.sourceMode.width},{"height",e.source.sourceMode.height},{"refreshNumerator",e.refresh.Numerator},{"refreshDenominator",e.refresh.Denominator}});
-            if(config.ready()){build(config.monitor);build(config.tv);build(config.both);report["profileValidation"]="passed";report["network"]=probe(config)==Signal::On?"on":"not-on";}writeJson(root/L"diagnostics.json",report);return 0;
+            json report={{"version","0.1.1"},{"displays",json::array()}};for(auto& e:capture(query()))report["displays"].push_back({{"name",e.device.name},{"width",e.source.sourceMode.width},{"height",e.source.sourceMode.height},{"refreshNumerator",e.refresh.Numerator},{"refreshDenominator",e.refresh.Denominator}});
+            if(config.ready()){for(auto pair:{std::pair{"monitor",&config.monitor},std::pair{"tv",&config.tv},std::pair{"both",&config.both}}){try{build(*pair.second);report["profileValidation"][pair.first]="passed";}catch(const DisplayUnavailable&){report["profileValidation"][pair.first]="unavailable";}}report["network"]=probe(config)==Signal::On?"on":"not-on";}writeJson(root/L"diagnostics.json",report);return 0;
         }
-        if(!args.empty()&&args[0]==L"--startup-on"){if(!config.ready())throw std::runtime_error("Complete setup before enabling autostart");autostart(true);config.startup=true;writeJson(root/L"config.json",config.save());return 0;}
-        if(!args.empty()&&args[0]==L"--startup-off"){autostart(false);if(config.ready()){config.startup=false;writeJson(root/L"config.json",config.save());}return 0;}
+        if(!args.empty()&&args[0]==L"--startup-on"){if(!config.ready())throw std::runtime_error("Complete setup before enabling autostart");bool old=config.startup;try{autostart(true);config.startup=true;writeJson(root/L"config.json",config.save());}catch(...){try{autostart(old);}catch(...){}throw;}if(auto target=FindWindowW(className.c_str(),nullptr))PostMessageW(target,WM_COMMAND_REMOTE,9,0);return 0;}
+        if(!args.empty()&&args[0]==L"--startup-off"){autostart(false);if(config.ready()){config.startup=false;writeJson(root/L"config.json",config.save());}if(auto target=FindWindowW(className.c_str(),nullptr))PostMessageW(target,WM_COMMAND_REMOTE,9,0);return 0;}
         unsigned command=args.empty()?1:commandNumber(args[0]);
         singleton=CreateMutexW(nullptr,TRUE,mutexName.c_str());if(!singleton)throw std::runtime_error("Cannot create single-instance lock");bool existing=GetLastError()==ERROR_ALREADY_EXISTS;
         if(existing){HWND target=nullptr;for(int retry=0;retry<30&&!target;++retry){target=FindWindowW(className.c_str(),nullptr);if(!target)Sleep(100);}if(!target)throw std::runtime_error("Running instance did not respond");PostMessageW(target,WM_COMMAND_REMOTE,command?command:7,0);CloseHandle(singleton);return 0;}
@@ -298,14 +324,14 @@ int wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int){
         mainWindow=CreateWindowExW(WS_EX_TOOLWINDOW,cls.lpszClassName,L"ScreenRelay",WS_POPUP,0,0,0,0,nullptr,nullptr,instance,nullptr);if(!mainWindow)throw std::runtime_error("Cannot create hidden command window");
         if(!args.empty()&&args[0]==L"--trial-tv"){manual(Action::Tv,true);CloseHandle(singleton);return 0;}
         if(!args.empty()&&args[0]==L"--trial-monitor"){manual(Action::Monitor,true);CloseHandle(singleton);return 0;}
-        try{registerKeys();}catch(const std::exception& e){messageError(e,false);command=7;}
+        registerKeys(false);
         poller=std::thread(worker);
         if(!config.ready())showSettings();else{try{handleCommand(command?command:7);}catch(const std::exception& e){messageError(e,command!=1);}}
         MSG msg{};while(GetMessageW(&msg,nullptr,0,0)>0){if(!settingsWindow||!IsDialogMessageW(settingsWindow,&msg)){TranslateMessage(&msg);DispatchMessageW(&msg);}}
-        quitWorker=true;wakeWorker.notify_all();poller.join();for(int id=1;id<=3;++id)UnregisterHotKey(mainWindow,id);DestroyWindow(mainWindow);CloseHandle(singleton);log("Stopped");CoUninitialize();return 0;
+        quitWorker=true;wakeWorker.notify_all();poller.join();running=false;paused=true;status();for(int id=1;id<=3;++id)UnregisterHotKey(mainWindow,id);DestroyWindow(mainWindow);CloseHandle(singleton);log("Stopped");CoUninitialize();return 0;
     }catch(const std::exception& e){
         quitWorker=true;wakeWorker.notify_all();if(poller.joinable())poller.join();if(singleton)CloseHandle(singleton);log(std::string("Startup failed: ")+e.what());
         // Explicit command invocations report failure in local status, not background popups.
-        try{writeJson(root/L"status.json",{{"automatic",false},{"lastError",e.what()}});}catch(...){}return 1;
+        if(!GetCommandLineW()||std::wstring(GetCommandLineW()).find(L"--rollback")==std::wstring::npos)try{writeJson(root/L"status.json",{{"running",false},{"automatic",false},{"lastError",e.what()}});}catch(...){}return 1;
     }
 }
