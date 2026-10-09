@@ -18,3 +18,7 @@ The v0.1.0 startup failure was traced to the installation path being inaccessibl
 Two missed network replies deliberately mean off; this is inferred power state, not HDMI power telemetry. Incomplete responses and transient server errors instead keep polling without choosing a screen. A permanently hung driver cannot be repaired by this user-mode utility; the independent guard waits for the display lock rather than silently abandoning recovery.
 
 Old binaries, prototype and private configuration remain local backups, excluded from source/releases.
+
+Additional native results:
+- Controlled LAN HTTP fixture: five stalled responses cancelled in 203-218 ms, followed by 100 complete replies at 500 ms cadence. Fixture listener readiness was explicitly checked before the final run.
+- 120-second measurement of the installed controller polling a powered-on TV: 16.21 MiB working set/observed peak, 3.51 MiB private memory, 0.078 CPU seconds, 0.0054% average total CPU on the tested PC. This is a short measured sample, not a 24/7 guarantee.

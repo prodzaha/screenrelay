@@ -20,7 +20,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist/package | Out-Null
-          Copy-Item build/Release/ScreenRelay.exe,README.md,README.ru.md,LICENSE,vendor/JSON-LICENSE -Destination dist/package
+          Copy-Item build/Release/ScreenRelay.exe,portable.flag,README.md,README.ru.md,LICENSE,vendor/JSON-LICENSE -Destination dist/package
           Copy-Item AGENTS.md -Destination dist/package
           Copy-Item docs -Destination dist/package -Recurse
           Compress-Archive -Path dist/package/* -DestinationPath dist/ScreenRelay-windows-x64.zip
